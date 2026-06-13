@@ -1,0 +1,20 @@
+[project]
+name = "instagram-mcp"
+version = "0.1.0"
+description = "MCP server that posts photos to Instagram Professional + linked Facebook Page via Meta Graph API"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=1.2.0",
+    "httpx>=0.27",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+instagram-mcp = "server:mcp.run"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["server", "meta_client"]
