@@ -59,6 +59,20 @@ def read_metadata(path: pathlib.Path) -> dict[str, Any]:
                 continue
             flat[name] = _stringify(raw)
 
+        # IFD0 only carries Make/Model/Orientation/etc. — the shooting params
+        # (FNumber, ExposureTime, ISO, FocalLength, LensModel) live in the
+        # EXIF SubIFD and have to be pulled in explicitly.
+        if hasattr(exif, "get_ifd"):
+            try:
+                exif_ifd = exif.get_ifd(ExifTags.IFD.Exif) or {}
+            except Exception:
+                exif_ifd = {}
+            for tag_id, raw in exif_ifd.items():
+                name = ExifTags.TAGS.get(tag_id, f"Tag{tag_id}")
+                if name == "GPSInfo":
+                    continue
+                flat.setdefault(name, _stringify(raw))
+
         gps_raw = exif.get_ifd(ExifTags.IFD.GPSInfo) if hasattr(exif, "get_ifd") else {}
         gps: dict[str, Any] = {}
         for tag_id, raw in (gps_raw or {}).items():
