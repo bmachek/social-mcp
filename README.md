@@ -18,10 +18,15 @@ as of 2026-02-18):
 | Step | Endpoint |
 | ---- | -------- |
 | Create IG media container | `POST /{ig-user-id}/media` (`image_url`, `caption`, optional `alt_text`) |
+| Create IG carousel child  | `POST /{ig-user-id}/media` (`image_url`, `is_carousel_item=true`) |
+| Create IG carousel parent | `POST /{ig-user-id}/media` (`media_type=CAROUSEL`, `children=…`) |
+| Create IG Reel container  | `POST /{ig-user-id}/media` (`media_type=REELS`, `video_url`, `share_to_feed`) |
 | Poll container status     | `GET /{container-id}?fields=status_code` — wait for `FINISHED` |
 | Publish IG container      | `POST /{ig-user-id}/media_publish?creation_id=…` |
 | Check publishing quota    | `GET /{ig-user-id}/content_publishing_limit` (50 posts / 24 h) |
 | Post FB Page photo        | `POST /{page-id}/photos` (`url`, `message`, `published`) |
+| Post FB Page video        | `POST /{page-id}/videos` (`file_url` or multipart `source`, `description`) |
+| Publish FB Page Reel      | `POST /{page-id}/video_reels` resumable (`upload_phase=start` → byte transfer → `upload_phase=finish`) |
 | Introspect token          | `GET /debug_token?input_token=…` |
 
 ## Tools exposed over MCP
@@ -30,9 +35,19 @@ as of 2026-02-18):
 | ---- | ------- |
 | `post_instagram_photo(image_url, caption, alt_text="")` | Runs the full IG two-step flow, polls until `FINISHED`, publishes. Validates the URL is reachable and `image/*` first. |
 | `post_facebook_photo(image_url, caption, published=True)` | Single POST to the Page's `/photos` edge. |
-| `post_instagram_local_photo(filename, caption, alt_text="")` | Like `post_instagram_photo` but takes a filename from `data/images/`; the file is briefly served via the nginx sidecar so Meta can fetch it. Moves to `data/posted/YYYY-MM-DD/` on success. |
-| `post_facebook_local_photo(filename, caption, published=True)` | Uploads a file from `data/images/` directly via multipart to the Page (no public URL needed). |
-| `list_pending_images()` | Lists candidates in `data/images/` so the model knows which filenames are postable. |
+| `post_instagram_local_photo(filename, caption, alt_text="", also_story=True)` | Like `post_instagram_photo` but takes a filename from `data/images/`; the file is briefly served via the nginx sidecar so Meta can fetch it. Moves to `data/posted/YYYY-MM-DD/` on success. |
+| `post_facebook_local_photo(filename, caption, also_story=True, group_ids=None)` | Uploads a file from `data/images/` directly via multipart to the Page (no public URL needed). |
+| `post_instagram_local_carousel(filenames, caption)` | Multi-photo IG carousel (2–10 images) from inbox files. Builds one child container per slide, then a `CAROUSEL` parent, then publishes. |
+| `post_facebook_local_carousel(filenames, caption)` | Multi-photo FB Page feed post (2–10 images): uploads each unpublished to `/photos`, then creates a single feed post with `attached_media[]`. |
+| `post_instagram_reel(video_url, caption, share_to_feed=True)` | IG Reel from a public video URL — `media_type=REELS` container, longer poll timeout (default 600 s), then publish. |
+| `post_instagram_local_reel(filename, caption, share_to_feed=True)` | Reel from an mp4/mov in `data/images/`. Stages the video via the nginx sidecar, publishes, archives. |
+| `post_facebook_video(video_url, caption, published=True)` | Regular Page video post via `/{page-id}/videos?file_url=…`. |
+| `post_facebook_local_video(filename, caption, published=True)` | Multipart upload of a local mp4/mov to the Page as a regular video post. |
+| `post_facebook_local_reel(filename, description)` | Facebook Page Reel via the three-phase resumable-upload protocol against `/{page-id}/video_reels`. |
+| `list_pending_images()` / `list_pending_videos()` | List candidates in `data/images/` so the model knows which filenames are postable. The inbox holds both — `.jpg/.png/.webp/.heic/.heif/.gif` are images, `.mp4/.mov/.m4v` are videos. |
+| `schedule_instagram_local_reel(filename, when, caption, share_to_feed=True)` | Queue an IG Reel for later. `when` accepts `in 2h`, `in 1d`, or an ISO timestamp (Europe/Berlin if naive). |
+| `schedule_facebook_local_video(filename, when, caption, published=True)` | Queue a Page video post for later. |
+| `schedule_facebook_local_reel(filename, when, description)` | Queue an FB Page Reel for later. |
 | `check_token_validity()` | Calls `/debug_token`, returns scopes, type, expiry (Unix + ISO), valid flag, and the configured Graph API version. |
 
 Errors from Meta are surfaced verbatim — `code`, `error_subcode`, `message`,
@@ -235,25 +250,41 @@ Then ask Claude Code something like:
 
 ## Local-folder workflow
 
-For posting without first uploading the image anywhere external:
+For posting without first uploading the image or video anywhere external:
 
 ```
 data/
-├── images/                 # drop files here
+├── images/                 # drop image and video files here
 ├── public/                 # transient: nginx serves <token>/<filename>
 └── posted/YYYY-MM-DD/      # archive after successful publish
 ```
 
-1. Copy a JPEG/PNG into `/opt/social/data/images/`.
+1. Copy a JPEG/PNG (or MP4/MOV for Reels) into `/opt/social/data/images/`.
 2. Ask Claude: *"List my pending images, then post `sunset.jpg` to Instagram
-   with the caption 'Evening over the Alps.'"*
-3. The MCP server hardlinks the file into `data/public/<random-token>/sunset.jpg`,
-   nginx serves it at `https://social.example.com/<token>/sunset.jpg`, Meta
+   with the caption 'Evening over the Alps.'"* — or *"post `reel.mp4` as an IG
+   Reel with caption '…'."*
+3. The MCP server hardlinks the file into `data/public/<random-token>/<name>`,
+   nginx serves it at `https://social.example.com/<token>/<name>`, Meta
    fetches it, the token directory is removed, the original is moved to
-   `data/posted/YYYY-MM-DD/sunset.jpg`.
+   `data/posted/YYYY-MM-DD/<name>`.
 
-**Facebook** doesn't need the public URL — `post_facebook_local_photo`
-uploads the bytes directly via multipart `source`.
+**Facebook** doesn't need the public URL — `post_facebook_local_photo` and
+`post_facebook_local_video` upload the bytes directly via multipart `source`,
+and `post_facebook_local_reel` uses Meta's resumable upload endpoint.
+
+### Reels & video notes
+
+- IG Reels and FB videos go through `data/images/` as well — the inbox isn't
+  image-only, despite the directory name. Use `list_pending_videos` to see only
+  `.mp4 / .mov / .m4v` candidates.
+- Reel container processing is much slower than photos. Default Reel timeout
+  is `IG_REEL_CONTAINER_TIMEOUT_SECONDS=600` with `IG_REEL_CONTAINER_POLL_SECONDS=5`
+  (vs. 90 s / 3 s for photos). Override in `.env` if your clips are very long.
+- `post_instagram_reel(share_to_feed=True)` (default) makes the Reel show up in
+  the main feed grid as well; pass `False` for Reels-tab-only.
+- FB Page Reels use a different surface than regular video posts: pick
+  `post_facebook_local_reel` for Reels, `post_facebook_local_video` for the
+  classic Page video player.
 
 ### Reverse-proxy snippet (Caddy)
 

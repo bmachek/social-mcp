@@ -196,30 +196,47 @@ class MetaClient:
             "pages_show_list."
         )}})
 
+    async def _probe_url(self, url: str) -> httpx.Response:
+        try:
+            r = await self._client.head(url, follow_redirects=True)
+            if r.status_code == 405 or r.status_code >= 400:
+                r = await self._client.get(
+                    url, follow_redirects=True, headers={"Range": "bytes=0-0"},
+                )
+        except httpx.HTTPError as e:
+            raise RuntimeError(f"url not reachable: {e}") from e
+        if r.status_code >= 400:
+            raise RuntimeError(
+                f"url returned HTTP {r.status_code}; Meta servers will not be able to fetch it"
+            )
+        return r
+
     async def validate_image_url(self, image_url: str) -> dict[str, Any]:
         """Confirm the URL is publicly reachable and looks like an image.
 
         Instagram requires the image to be downloadable by Meta's servers.
         We HEAD first, fall back to a 1-byte range GET if HEAD is rejected.
         """
-        try:
-            r = await self._client.head(image_url, follow_redirects=True)
-            if r.status_code == 405 or r.status_code >= 400:
-                r = await self._client.get(
-                    image_url,
-                    follow_redirects=True,
-                    headers={"Range": "bytes=0-0"},
-                )
-        except httpx.HTTPError as e:
-            raise RuntimeError(f"image_url not reachable: {e}") from e
-        if r.status_code >= 400:
-            raise RuntimeError(
-                f"image_url returned HTTP {r.status_code}; Meta servers will not be able to fetch it"
-            )
+        r = await self._probe_url(image_url)
         ctype = r.headers.get("content-type", "")
         if ctype and not ctype.startswith("image/"):
             raise RuntimeError(
                 f"image_url content-type is {ctype!r}; expected image/* for Instagram publishing"
+            )
+        return {
+            "status": r.status_code,
+            "content_type": ctype or "unknown",
+            "content_length": r.headers.get("content-length"),
+            "final_url": str(r.url),
+        }
+
+    async def validate_video_url(self, video_url: str) -> dict[str, Any]:
+        """Confirm the URL is publicly reachable and looks like a video."""
+        r = await self._probe_url(video_url)
+        ctype = r.headers.get("content-type", "")
+        if ctype and not ctype.startswith("video/"):
+            raise RuntimeError(
+                f"video_url content-type is {ctype!r}; expected video/* for Reel publishing"
             )
         return {
             "status": r.status_code,
@@ -279,6 +296,37 @@ class MetaClient:
         }
         if caption:
             data["caption"] = caption
+        page_token = await self.get_page_access_token()
+        payload = await self._request(
+            "POST", f"{self.ig_user_id}/media", data=data, token=page_token,
+        )
+        cid = payload.get("id")
+        if not cid:
+            raise MetaAPIError({"error": {"message": f"unexpected response: {payload}"}})
+        return str(cid)
+
+    async def create_ig_reel_container(
+        self,
+        video_url: str,
+        caption: str | None = None,
+        share_to_feed: bool = True,
+        thumb_offset_ms: int | None = None,
+    ) -> str:
+        """IG Reel: POST /{ig-user-id}/media with media_type=REELS and video_url.
+
+        Reel containers take noticeably longer than photo containers to reach
+        FINISHED — Meta has to download, transcode and validate the video.
+        Callers should bump the wait_for_container timeout accordingly.
+        """
+        data: dict[str, Any] = {
+            "media_type": "REELS",
+            "video_url": video_url,
+            "share_to_feed": "true" if share_to_feed else "false",
+        }
+        if caption:
+            data["caption"] = caption
+        if thumb_offset_ms is not None:
+            data["thumb_offset"] = str(int(thumb_offset_ms))
         page_token = await self.get_page_access_token()
         payload = await self._request(
             "POST", f"{self.ig_user_id}/media", data=data, token=page_token,
@@ -410,6 +458,132 @@ class MetaClient:
         return await self._request(
             "POST", f"{self.fb_page_id}/feed", data=data, token=page_token,
         )
+
+    async def post_fb_page_video_url(
+        self,
+        video_url: str,
+        caption: str | None = None,
+        published: bool = True,
+    ) -> dict[str, Any]:
+        """Post a video to the Page via its public URL: POST /{page-id}/videos.
+
+        Meta downloads, transcodes, then posts. The response carries `id` (the
+        video id) immediately; the post becomes visible once Meta has finished
+        processing.
+        """
+        data: dict[str, Any] = {
+            "file_url": video_url,
+            "published": str(published).lower(),
+        }
+        if caption:
+            data["description"] = caption
+        page_token = await self.get_page_access_token()
+        return await self._request(
+            "POST", f"{self.fb_page_id}/videos", data=data, token=page_token,
+        )
+
+    async def post_fb_page_video_file(
+        self,
+        file_path: pathlib.Path,
+        caption: str | None = None,
+        published: bool = True,
+    ) -> dict[str, Any]:
+        """Multipart-upload a local video to the Page: POST /{page-id}/videos.
+
+        Suitable for clips up to a few hundred MB. For very large files or for
+        Page Reels (which require the resumable upload protocol) use
+        publish_fb_reel_file instead.
+        """
+        page_token = await self.get_page_access_token()
+        url = f"{self.base}/{self.fb_page_id}/videos"
+        data: dict[str, Any] = {
+            "access_token": page_token,
+            "published": str(published).lower(),
+        }
+        if caption:
+            data["description"] = caption
+        mime = mimetypes.guess_type(file_path.name)[0] or "video/mp4"
+        content = file_path.read_bytes()
+        files = {"source": (file_path.name, content, mime)}
+        # Video uploads can take a while server-side; bump per-request timeout.
+        resp = await self._client.post(url, data=data, files=files, timeout=600.0)
+        try:
+            payload = resp.json()
+        except ValueError:
+            payload = {"error": {"message": resp.text or "non-JSON response"}}
+        if resp.status_code >= 400 or (isinstance(payload, dict) and "error" in payload):
+            raise MetaAPIError(payload, http_status=resp.status_code)
+        return payload
+
+    async def publish_fb_reel_file(
+        self,
+        file_path: pathlib.Path,
+        description: str | None = None,
+    ) -> dict[str, Any]:
+        """Publish a Facebook Page Reel via the resumable upload protocol.
+
+        Three steps against /{page-id}/video_reels:
+          1. upload_phase=start  -> returns {video_id, upload_url}
+          2. POST upload_url with the file bytes; header 'offset: 0' and
+             'file_size: <bytes>'; Authorization: OAuth <page_token>.
+          3. upload_phase=finish&video_id=...&video_state=PUBLISHED[&description=...]
+        """
+        size = file_path.stat().st_size
+        if size <= 0:
+            raise MetaAPIError({"error": {"message": f"empty video file: {file_path}"}})
+
+        page_token = await self.get_page_access_token()
+        start = await self._request(
+            "POST",
+            f"{self.fb_page_id}/video_reels",
+            data={"upload_phase": "start"},
+            token=page_token,
+        )
+        video_id = start.get("video_id")
+        upload_url = start.get("upload_url")
+        if not video_id or not upload_url:
+            raise MetaAPIError(
+                {"error": {"message": f"reel start missing video_id/upload_url: {start}"}}
+            )
+
+        content = file_path.read_bytes()
+        headers = {
+            "Authorization": f"OAuth {page_token}",
+            "offset": "0",
+            "file_size": str(size),
+        }
+        # Reel uploads stream the bytes raw as the request body, no multipart.
+        up = await self._client.post(
+            upload_url, content=content, headers=headers, timeout=600.0,
+        )
+        try:
+            up_payload = up.json()
+        except ValueError:
+            up_payload = {"error": {"message": up.text or "non-JSON upload response"}}
+        if up.status_code >= 400 or (
+            isinstance(up_payload, dict) and up_payload.get("success") is False
+        ) or (isinstance(up_payload, dict) and "error" in up_payload):
+            raise MetaAPIError(up_payload, http_status=up.status_code)
+
+        finish_data: dict[str, Any] = {
+            "upload_phase": "finish",
+            "video_id": str(video_id),
+            "video_state": "PUBLISHED",
+        }
+        if description:
+            finish_data["description"] = description
+        finish = await self._request(
+            "POST",
+            f"{self.fb_page_id}/video_reels",
+            data=finish_data,
+            token=page_token,
+        )
+        return {
+            "video_id": str(video_id),
+            "start": start,
+            "upload": up_payload,
+            "finish": finish,
+        }
 
     async def list_ig_recent_media(
         self,

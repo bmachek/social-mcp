@@ -73,6 +73,8 @@ META_APP_ID = os.getenv("META_APP_ID")
 META_APP_SECRET = os.getenv("META_APP_SECRET")
 CONTAINER_TIMEOUT = float(os.getenv("IG_CONTAINER_TIMEOUT_SECONDS", "90"))
 CONTAINER_POLL = float(os.getenv("IG_CONTAINER_POLL_SECONDS", "3"))
+REEL_CONTAINER_TIMEOUT = float(os.getenv("IG_REEL_CONTAINER_TIMEOUT_SECONDS", "600"))
+REEL_CONTAINER_POLL = float(os.getenv("IG_REEL_CONTAINER_POLL_SECONDS", "5"))
 DATA_DIR = pathlib.Path(os.getenv("DATA_DIR", "/data"))
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 FB_GROUP_IDS_DEFAULT = _parse_id_list(os.getenv("FB_GROUP_IDS"))
@@ -293,6 +295,21 @@ async def list_pending_images() -> dict[str, Any]:
 
 
 @mcp.tool()
+async def list_pending_videos() -> dict[str, Any]:
+    """List video files (mp4/mov/m4v) in the inbox — usable by the reel tools."""
+    try:
+        items = local_files.list_videos(DATA_DIR)
+    except Exception as e:
+        return _err("listing videos failed", e)
+    return {
+        "ok": True,
+        "count": len(items),
+        "videos_dir": str(local_files.images_dir(DATA_DIR)),
+        "videos": items,
+    }
+
+
+@mcp.tool()
 async def get_image_metadata(filename: str) -> dict[str, Any]:
     """Return EXIF + dimensions for an image in the inbox.
 
@@ -469,6 +486,234 @@ async def post_facebook_local_photo(
         if also_story:
             out["story"] = await _post_fb_story_from_file(client, src)
 
+    try:
+        archived = local_files.archive(DATA_DIR, src)
+        out["archived_to"] = str(archived)
+    except Exception as e:
+        log.warning("archive failed for %s: %s", filename, e)
+        out["archive_warning"] = str(e)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Tools — Reels (IG video) & FB Page video / Reel
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def post_instagram_reel(
+    video_url: str,
+    caption: str = "",
+    share_to_feed: bool = True,
+) -> dict[str, Any]:
+    """Publish an Instagram Reel from a publicly reachable video URL.
+
+    Runs the Reels two-step flow (`media_type=REELS`) and polls for FINISHED
+    with a longer timeout than photo posts, since Meta has to transcode the
+    video server-side. `share_to_feed=True` (default) also shows the Reel in
+    the main IG feed grid.
+    """
+    log.info("post_instagram_reel url=%s share_to_feed=%s", video_url, share_to_feed)
+    async with _new_client() as client:
+        try:
+            url_info = await client.validate_video_url(video_url)
+        except Exception as e:
+            return _err("video_url validation failed", e)
+
+        try:
+            limit = await client.get_publishing_limit()
+            usage = (limit.get("data") or [{}])[0].get("quota_usage")
+            if isinstance(usage, int) and usage >= 50:
+                return {
+                    "ok": False,
+                    "error": "rate_limit",
+                    "detail": "Instagram 24h publishing quota exhausted (50 posts)",
+                    "quota_usage": usage,
+                }
+        except MetaAPIError as e:
+            log.warning("publishing_limit check failed (non-fatal): %s", e)
+            usage = None
+
+        try:
+            container_id = await client.create_ig_reel_container(
+                video_url=video_url,
+                caption=caption or None,
+                share_to_feed=share_to_feed,
+            )
+        except Exception as e:
+            return _err("create_reel_container failed", e)
+
+        try:
+            status = await client.wait_for_container(
+                container_id,
+                timeout_seconds=REEL_CONTAINER_TIMEOUT,
+                poll_interval=REEL_CONTAINER_POLL,
+            )
+        except Exception as e:
+            return _err(f"reel container {container_id} did not reach FINISHED", e)
+
+        try:
+            published = await client.publish_ig_container(container_id)
+        except Exception as e:
+            return _err(f"reel publish failed for container {container_id}", e)
+
+        return {
+            "ok": True,
+            "media_id": published.get("id"),
+            "container_id": container_id,
+            "container_final_status": status.status_code,
+            "video_url_validation": url_info,
+            "publishing_quota_usage": usage,
+            "share_to_feed": share_to_feed,
+        }
+
+
+@mcp.tool()
+async def post_instagram_local_reel(
+    filename: str,
+    caption: str = "",
+    share_to_feed: bool = True,
+) -> dict[str, Any]:
+    """Publish a Reel from an mp4/mov in the inbox.
+
+    Stages the video via the nginx sidecar at a one-shot URL, calls
+    `post_instagram_reel`, then archives the source under `data/posted/`.
+    """
+    if not PUBLIC_BASE_URL:
+        return {"ok": False, "error": "PUBLIC_BASE_URL not configured — set it in .env"}
+    try:
+        src = local_files.resolve_video(DATA_DIR, filename)
+    except LocalFileError as e:
+        return {"ok": False, "error": str(e)}
+
+    try:
+        token, _link, public_url = local_files.stage_for_serving(DATA_DIR, src, PUBLIC_BASE_URL)
+    except Exception as e:
+        return _err("staging file for serving failed", e)
+
+    log.info("post_instagram_local_reel file=%s url=%s", filename, public_url)
+    try:
+        result = await post_instagram_reel(
+            public_url, caption=caption, share_to_feed=share_to_feed,
+        )
+    finally:
+        local_files.unstage(DATA_DIR, token)
+
+    if result.get("ok"):
+        try:
+            archived = local_files.archive(DATA_DIR, src)
+            result["archived_to"] = str(archived)
+        except Exception as e:
+            log.warning("archive failed for %s: %s", filename, e)
+            result["archive_warning"] = str(e)
+        result["source_filename"] = filename
+        result["served_url"] = public_url
+    return result
+
+
+@mcp.tool()
+async def post_facebook_video(
+    video_url: str,
+    caption: str = "",
+    published: bool = True,
+) -> dict[str, Any]:
+    """Post a video to the Facebook Page via a public URL.
+
+    Meta downloads and transcodes the video, then publishes it as a regular
+    Page video post (not a Reel — see `post_facebook_local_reel` for Reels).
+    """
+    log.info("post_facebook_video url=%s published=%s", video_url, published)
+    async with _new_client() as client:
+        try:
+            await client.validate_video_url(video_url)
+        except Exception as e:
+            return _err("video_url validation failed", e)
+
+        try:
+            result = await client.post_fb_page_video_url(
+                video_url=video_url, caption=caption or None, published=published,
+            )
+        except Exception as e:
+            return _err("facebook page video post failed", e)
+
+        return {
+            "ok": True,
+            "video_id": result.get("id"),
+            "raw": result,
+        }
+
+
+@mcp.tool()
+async def post_facebook_local_video(
+    filename: str,
+    caption: str = "",
+    published: bool = True,
+) -> dict[str, Any]:
+    """Multipart-upload a video from the inbox to the Facebook Page.
+
+    Use this for regular Page video posts. For Reels specifically, use
+    `post_facebook_local_reel` (different upload protocol, different surface).
+    """
+    try:
+        src = local_files.resolve_video(DATA_DIR, filename)
+    except LocalFileError as e:
+        return {"ok": False, "error": str(e)}
+
+    log.info("post_facebook_local_video file=%s published=%s", filename, published)
+    async with _new_client() as client:
+        try:
+            raw = await client.post_fb_page_video_file(
+                file_path=src, caption=caption or None, published=published,
+            )
+        except Exception as e:
+            return _err("facebook page video upload failed", e)
+
+    out: dict[str, Any] = {
+        "ok": True,
+        "source_filename": filename,
+        "video_id": raw.get("id"),
+        "raw": raw,
+    }
+    try:
+        archived = local_files.archive(DATA_DIR, src)
+        out["archived_to"] = str(archived)
+    except Exception as e:
+        log.warning("archive failed for %s: %s", filename, e)
+        out["archive_warning"] = str(e)
+    return out
+
+
+@mcp.tool()
+async def post_facebook_local_reel(
+    filename: str,
+    description: str = "",
+) -> dict[str, Any]:
+    """Publish a Facebook Page Reel from a local mp4/mov via resumable upload.
+
+    Runs the three-phase /{page-id}/video_reels protocol: start → transfer
+    bytes → finish with `video_state=PUBLISHED`. Source file is archived on
+    success.
+    """
+    try:
+        src = local_files.resolve_video(DATA_DIR, filename)
+    except LocalFileError as e:
+        return {"ok": False, "error": str(e)}
+
+    log.info("post_facebook_local_reel file=%s", filename)
+    async with _new_client() as client:
+        try:
+            raw = await client.publish_fb_reel_file(
+                file_path=src, description=description or None,
+            )
+        except Exception as e:
+            return _err("facebook reel publish failed", e)
+
+    out: dict[str, Any] = {
+        "ok": True,
+        "source_filename": filename,
+        "video_id": raw.get("video_id"),
+        "raw": raw,
+    }
     try:
         archived = local_files.archive(DATA_DIR, src)
         out["archived_to"] = str(archived)
@@ -684,7 +929,7 @@ async def list_recent_facebook_posts(
 def _schedule(target: str, when: str, filenames: list[str], run_kwargs: dict[str, Any]) -> dict[str, Any]:
     for fn in filenames:
         try:
-            local_files.resolve_image(DATA_DIR, fn)
+            local_files.resolve_media(DATA_DIR, fn)
         except LocalFileError as e:
             return {"ok": False, "error": str(e)}
     try:
@@ -772,6 +1017,47 @@ async def schedule_facebook_local_carousel(
     return _schedule(
         "facebook_carousel", when, filenames,
         {"filenames": filenames, "caption": caption},
+    )
+
+
+@mcp.tool()
+async def schedule_instagram_local_reel(
+    filename: str,
+    when: str,
+    caption: str = "",
+    share_to_feed: bool = True,
+) -> dict[str, Any]:
+    """Queue an IG Reel for later. See schedule_instagram_local_photo for `when` formats."""
+    return _schedule(
+        "instagram_reel", when, [filename],
+        {"filename": filename, "caption": caption, "share_to_feed": share_to_feed},
+    )
+
+
+@mcp.tool()
+async def schedule_facebook_local_video(
+    filename: str,
+    when: str,
+    caption: str = "",
+    published: bool = True,
+) -> dict[str, Any]:
+    """Queue a regular Facebook Page video post for later."""
+    return _schedule(
+        "facebook_video", when, [filename],
+        {"filename": filename, "caption": caption, "published": published},
+    )
+
+
+@mcp.tool()
+async def schedule_facebook_local_reel(
+    filename: str,
+    when: str,
+    description: str = "",
+) -> dict[str, Any]:
+    """Queue a Facebook Page Reel for later."""
+    return _schedule(
+        "facebook_reel", when, [filename],
+        {"filename": filename, "description": description},
     )
 
 

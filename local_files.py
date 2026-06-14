@@ -19,6 +19,8 @@ from urllib.parse import quote
 log = logging.getLogger("instagram-mcp")
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif", ".gif"}
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v"}
+MEDIA_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
 
 
 class LocalFileError(RuntimeError):
@@ -29,6 +31,10 @@ def images_dir(data_dir: pathlib.Path) -> pathlib.Path:
     return data_dir / "images"
 
 
+def is_video(path: pathlib.Path) -> bool:
+    return path.suffix.lower() in VIDEO_EXTENSIONS
+
+
 def public_dir(data_dir: pathlib.Path) -> pathlib.Path:
     return data_dir / "public"
 
@@ -37,8 +43,7 @@ def posted_dir(data_dir: pathlib.Path) -> pathlib.Path:
     return data_dir / "posted"
 
 
-def resolve_image(data_dir: pathlib.Path, filename: str) -> pathlib.Path:
-    """Resolve filename against images/ and refuse anything that escapes it."""
+def _resolve_in_images(data_dir: pathlib.Path, filename: str, allowed_exts: set[str]) -> pathlib.Path:
     if not filename or "/" in filename or "\\" in filename or filename.startswith("."):
         raise LocalFileError(f"invalid filename: {filename!r}")
     src = (images_dir(data_dir) / filename).resolve()
@@ -46,10 +51,30 @@ def resolve_image(data_dir: pathlib.Path, filename: str) -> pathlib.Path:
         raise LocalFileError(f"path escapes images dir: {filename!r}")
     if not src.is_file():
         raise LocalFileError(f"no such file in images/: {filename!r}")
+    if src.suffix.lower() not in allowed_exts:
+        raise LocalFileError(
+            f"unsupported file extension {src.suffix!r} for {filename!r}; "
+            f"allowed: {sorted(allowed_exts)}"
+        )
     return src
 
 
-def list_images(data_dir: pathlib.Path) -> list[dict[str, object]]:
+def resolve_image(data_dir: pathlib.Path, filename: str) -> pathlib.Path:
+    """Resolve an image filename against images/ and refuse anything that escapes it."""
+    return _resolve_in_images(data_dir, filename, IMAGE_EXTENSIONS)
+
+
+def resolve_video(data_dir: pathlib.Path, filename: str) -> pathlib.Path:
+    """Resolve a video filename against images/ (the inbox holds both)."""
+    return _resolve_in_images(data_dir, filename, VIDEO_EXTENSIONS)
+
+
+def resolve_media(data_dir: pathlib.Path, filename: str) -> pathlib.Path:
+    """Resolve any inbox media file (image or video)."""
+    return _resolve_in_images(data_dir, filename, MEDIA_EXTENSIONS)
+
+
+def _list_by_exts(data_dir: pathlib.Path, exts: set[str]) -> list[dict[str, object]]:
     p = images_dir(data_dir)
     if not p.is_dir():
         return []
@@ -59,11 +84,28 @@ def list_images(data_dir: pathlib.Path) -> list[dict[str, object]]:
             continue
         if child.name.startswith("."):
             continue
-        if child.suffix.lower() not in IMAGE_EXTENSIONS:
+        if child.suffix.lower() not in exts:
             continue
         stat = child.stat()
-        out.append({"name": child.name, "size_bytes": stat.st_size})
+        out.append({
+            "name": child.name,
+            "size_bytes": stat.st_size,
+            "kind": "video" if child.suffix.lower() in VIDEO_EXTENSIONS else "image",
+        })
     return out
+
+
+def list_images(data_dir: pathlib.Path) -> list[dict[str, object]]:
+    return _list_by_exts(data_dir, IMAGE_EXTENSIONS)
+
+
+def list_videos(data_dir: pathlib.Path) -> list[dict[str, object]]:
+    return _list_by_exts(data_dir, VIDEO_EXTENSIONS)
+
+
+def list_media(data_dir: pathlib.Path) -> list[dict[str, object]]:
+    """Both images and videos in the inbox, sorted by filename."""
+    return _list_by_exts(data_dir, MEDIA_EXTENSIONS)
 
 
 def stage_for_serving(

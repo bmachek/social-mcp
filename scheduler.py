@@ -120,6 +120,9 @@ def run_async_job(target: str, kwargs: dict[str, Any]) -> None:
         "instagram": server.post_instagram_local_photo,
         "facebook_carousel": server.post_facebook_local_carousel,
         "instagram_carousel": server.post_instagram_local_carousel,
+        "instagram_reel": server.post_instagram_local_reel,
+        "facebook_video": server.post_facebook_local_video,
+        "facebook_reel": server.post_facebook_local_reel,
     }
     fn = targets.get(target)
     if fn is None:
