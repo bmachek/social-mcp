@@ -92,7 +92,12 @@ def read_metadata(path: pathlib.Path) -> dict[str, Any]:
         "camera_make": flat.get("Make"),
         "camera_model": flat.get("Model"),
         "lens_model": flat.get("LensModel"),
-        "datetime_original": flat.get("DateTimeOriginal") or flat.get("DateTime"),
+        # DateTimeOriginal is when the shutter fired; DateTimeDigitized is the
+        # same for digital cameras and the digitization time for scanned film.
+        # Both live in the EXIF SubIFD. DateTime (IFD0) is the file-modify time
+        # that export tools like DxO/Lightroom rewrite, so we deliberately do
+        # NOT fall back to it.
+        "datetime_original": flat.get("DateTimeOriginal") or flat.get("DateTimeDigitized"),
         "exposure_time": flat.get("ExposureTime"),
         "f_number": flat.get("FNumber"),
         "iso": flat.get("ISOSpeedRatings") or flat.get("PhotographicSensitivity"),
