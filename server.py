@@ -297,6 +297,34 @@ async def list_pending_images() -> dict[str, Any]:
 
 
 @mcp.tool()
+async def mark_as_posted(filenames: list[str]) -> dict[str, Any]:
+    """Move one or more inbox files to posted/ without publishing them.
+
+    Use this when you've already posted a photo outside this tool (manually, via
+    another client, etc.) and want to prevent the autopilot from picking it up
+    again. Accepts images and videos. Each file is moved to
+    `data/posted/YYYY-MM-DD/<filename>` using today's date, exactly like a
+    successful post would do.
+    """
+    if not filenames:
+        return {"ok": False, "error": "filenames must be a non-empty list"}
+    results: list[dict[str, Any]] = []
+    for fn in filenames:
+        try:
+            src = local_files.resolve_media(DATA_DIR, fn)
+        except LocalFileError as e:
+            results.append({"filename": fn, "ok": False, "error": str(e)})
+            continue
+        try:
+            dest = local_files.archive(DATA_DIR, src)
+            results.append({"filename": fn, "ok": True, "archived_to": str(dest)})
+        except Exception as e:
+            results.append({"filename": fn, "ok": False, "error": str(e)})
+    ok = all(r["ok"] for r in results)
+    return {"ok": ok, "results": results}
+
+
+@mcp.tool()
 async def list_pending_videos() -> dict[str, Any]:
     """List video files (mp4/mov/m4v) in the inbox — usable by the reel tools."""
     try:
