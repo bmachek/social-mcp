@@ -1,307 +1,245 @@
-# instagram-mcp
+# social-mcp
 
-A small self-hosted [MCP](https://modelcontextprotocol.io) server that lets
-Claude Code (or any other MCP client) publish photos to your **Instagram
-Professional account** and the **linked Facebook Page** through the Meta
-Graph API.
+A self-hosted MCP server that gives Claude the ability to manage your Instagram and Facebook Page — post photos, carousels, and Reels, schedule posts, pull engagement analytics, and run an autopilot that plans and queues two weeks of content from your photo inbox in one go.
 
-Conversational use looks like:
+You drop files into a folder, ask Claude what to post and when, and it handles the rest: staging, uploading, archiving, and scheduling. Everything runs on your own machine; no third-party service touches your tokens or your media.
 
-> "Post `https://cdn.example.com/sunset.jpg` to Instagram with the caption
-> *'Evening over the Alps.'*"
+---
 
-## Endpoints used
+## What you can do with it
 
-Verified against `developers.facebook.com` (Graph API **v25.0**, latest stable
-as of 2026-02-18):
+**Post immediately**
+- Photo to Instagram feed + Story
+- Photo to Facebook Page feed + Story
+- Both platforms at once (one command, file archived once)
+- Carousel (2–10 photos) to IG, FB, or both
+- Reel / video to IG, FB, or both
+- Cross-post to Facebook Groups
 
-| Step | Endpoint |
-| ---- | -------- |
-| Create IG media container | `POST /{ig-user-id}/media` (`image_url`, `caption`, optional `alt_text`) |
-| Create IG carousel child  | `POST /{ig-user-id}/media` (`image_url`, `is_carousel_item=true`) |
-| Create IG carousel parent | `POST /{ig-user-id}/media` (`media_type=CAROUSEL`, `children=…`) |
-| Create IG Reel container  | `POST /{ig-user-id}/media` (`media_type=REELS`, `video_url`, `share_to_feed`) |
-| Poll container status     | `GET /{container-id}?fields=status_code` — wait for `FINISHED` |
-| Publish IG container      | `POST /{ig-user-id}/media_publish?creation_id=…` |
-| Check publishing quota    | `GET /{ig-user-id}/content_publishing_limit` (50 posts / 24 h) |
-| Post FB Page photo        | `POST /{page-id}/photos` (`url`, `message`, `published`) |
-| Post FB Page video        | `POST /{page-id}/videos` (`file_url` or multipart `source`, `description`) |
-| Publish FB Page Reel      | `POST /{page-id}/video_reels` resumable (`upload_phase=start` → byte transfer → `upload_phase=finish`) |
-| Introspect token          | `GET /debug_token?input_token=…` |
+**Schedule for later**
+- Any of the above, at a specific time or relative (`in 2h`, `tomorrow at 19:30`)
+- Persistent scheduler survives container restarts
 
-## Tools exposed over MCP
+**Analytics**
+- Account-level reach, engagement, followers (IG and FB)
+- Per-post insights — likes, comments, shares, saves, plays
+- Top-performing posts ranked by engagement (useful as caption examples)
 
-| Tool | Purpose |
-| ---- | ------- |
-| `post_instagram_photo(image_url, caption, alt_text="")` | Runs the full IG two-step flow, polls until `FINISHED`, publishes. Validates the URL is reachable and `image/*` first. |
-| `post_facebook_photo(image_url, caption, published=True)` | Single POST to the Page's `/photos` edge. |
-| `post_instagram_local_photo(filename, caption, alt_text="", also_story=True)` | Like `post_instagram_photo` but takes a filename from `data/images/`; the file is briefly served via the nginx sidecar so Meta can fetch it. Moves to `data/posted/YYYY-MM-DD/` on success. |
-| `post_facebook_local_photo(filename, caption, also_story=True, group_ids=None)` | Uploads a file from `data/images/` directly via multipart to the Page (no public URL needed). |
-| `post_instagram_local_carousel(filenames, caption)` | Multi-photo IG carousel (2–10 images) from inbox files. Builds one child container per slide, then a `CAROUSEL` parent, then publishes. |
-| `post_facebook_local_carousel(filenames, caption)` | Multi-photo FB Page feed post (2–10 images): uploads each unpublished to `/photos`, then creates a single feed post with `attached_media[]`. |
-| `post_instagram_reel(video_url, caption, share_to_feed=True)` | IG Reel from a public video URL — `media_type=REELS` container, longer poll timeout (default 600 s), then publish. |
-| `post_instagram_local_reel(filename, caption, share_to_feed=True)` | Reel from an mp4/mov in `data/images/`. Stages the video via the nginx sidecar, publishes, archives. |
-| `post_facebook_video(video_url, caption, published=True)` | Regular Page video post via `/{page-id}/videos?file_url=…`. |
-| `post_facebook_local_video(filename, caption, published=True)` | Multipart upload of a local mp4/mov to the Page as a regular video post. |
-| `post_facebook_local_reel(filename, description)` | Facebook Page Reel via the three-phase resumable-upload protocol against `/{page-id}/video_reels`. |
-| `list_pending_images()` / `list_pending_videos()` | List candidates in `data/images/` so the model knows which filenames are postable. The inbox holds both — `.jpg/.png/.webp/.heic/.heif/.gif` are images, `.mp4/.mov/.m4v` are videos. |
-| `schedule_instagram_local_reel(filename, when, caption, share_to_feed=True)` | Queue an IG Reel for later. `when` accepts `in 2h`, `in 1d`, or an ISO timestamp (Europe/Berlin if naive). |
-| `schedule_facebook_local_video(filename, when, caption, published=True)` | Queue a Page video post for later. |
-| `schedule_facebook_local_reel(filename, when, description)` | Queue an FB Page Reel for later. |
-| `check_token_validity()` | Calls `/debug_token`, returns scopes, type, expiry (Unix + ISO), valid flag, and the configured Graph API version. |
-| `post_local_photo_dual(filename, caption, alt_text="", also_story_ig=True, also_story_fb=True)` | Publish one photo to **both** IG and FB Page in a single job; archives the source once at the end. |
-| `post_local_carousel_dual(filenames, caption)` | Multi-photo carousel to both IG and FB Page in one job. |
-| `post_local_reel_dual(filename, caption, share_to_feed=True)` | IG Reel + FB Page Reel in one job, archives once. |
-| `get_instagram_account_insights(metric=[], period="day", since_days=None)` | Account-level IG reach / engagement / followers etc. |
-| `get_instagram_post_insights(media_id, metric=[])` | Per-post IG insights (reach, likes, comments, shares, saves, plays for Reels). |
-| `get_facebook_page_insights(metric=[], period="day", since_days=None)` | Page-level FB impressions / engaged users / fans. |
-| `get_facebook_post_insights(post_id, metric=[])` | Per-post FB insights (impressions, engaged users, clicks). |
-| `top_performing_posts(platform="instagram", limit=25, top_n=5)` | Rank recent posts by engagement score — use the top captions as few-shot examples when writing new ones. |
-| `autopilot_plan(days_ahead=14, max_posts=14, …)` | **Autopilot step 1** — deduplicate inbox with perceptual hash, cluster by EXIF time + GPS into carousels, propose a 2-week schedule. Returns a `plan` list with `caption: null` placeholders. |
-| `autopilot_commit(plan)` | **Autopilot step 2** — after you fill in captions, schedule every plan item at once. Validates all files before queuing. |
+**Autopilot**
+1. `autopilot_plan` — scans your inbox, deduplicates burst shots by perceptual hash, clusters photos taken close together in time and place into carousels, and proposes a two-week posting schedule
+2. You review the plan and write captions
+3. `autopilot_commit` — validates and queues everything at once
 
-Errors from Meta are surfaced verbatim — `code`, `error_subcode`, `message`,
-`fbtrace_id`, and the user-facing message if present — instead of being
-swallowed.
+---
 
-## Required scopes
+## How it works
 
-You're using the classic Facebook-Login → linked-Page → IG path (the right
-choice when the IG account is paired with a Page you own). Request these on
-the user access token when generating it in the Graph API Explorer:
+The server implements the [Model Context Protocol](https://modelcontextprotocol.io) (MCP), which is the standard way to give AI assistants access to external tools. Claude Code (or Claude Desktop) connects to it and gains a set of posting/scheduling/analytics tools backed by the Meta Graph API.
 
-- `pages_show_list` — needed so the server can derive a Page Access Token
-  from `/me/accounts`. Without it, **every** posting call fails.
-- `pages_read_engagement`
-- `pages_manage_posts` — required for all FB Page publishing
-  (`post_facebook_photo`, page photo upload, page feed, page stories).
-- `instagram_basic`
-- `instagram_content_publish` — required for every IG publish call
-  (feed photo, carousel, story).
-- `publish_to_groups` — only if you use `FB_GROUP_IDS` / cross-post to groups.
+For local files, an nginx sidecar briefly serves each image at a one-shot public URL so Meta's servers can fetch it; the URL is torn down and the file is archived once the post goes through. Facebook uploads go direct — no public URL needed.
 
-> The 2025 scope rename to `instagram_business_*` applies to the *Instagram
-> API with Instagram Login* flow, not this Facebook-Login flow.
+```
+Your photo inbox          MCP server               Meta Graph API
+  data/images/    →   stage → publish    →   Instagram / Facebook Page
+                      ↓ on success
+                  data/posted/YYYY-MM-DD/
+```
 
-### Token model used by the server
+---
 
-`META_ACCESS_TOKEN` is the long-lived **User** token. On the first publish
-call the server transparently fetches the **Page Access Token** for
-`FB_PAGE_ID` via `GET /me/accounts` (needs `pages_show_list`), caches it
-in-memory for the lifetime of the request, and uses it for:
+## Setup
 
-- every IG endpoint (`/{ig-user-id}/media`, `media_publish`,
-  `content_publishing_limit`, list)
-- every FB Page endpoint (`/{page-id}/photos`, `/feed`, `/photo_stories`,
-  list)
+See **[SETUP.md](SETUP.md)** for the full step-by-step guide (Meta App creation, token generation, `.env` configuration, Docker Compose, reverse proxy).
 
-Group posts (`/{group-id}/photos`) still use the user token because
-`publish_to_groups` is a user-level scope.
+Quick summary:
+1. Create a Meta App (type: Business) and add Facebook Login for Business + Instagram Graph API.
+2. Generate a long-lived User Access Token with the scopes below.
+3. Copy `.env.example` → `.env` and fill in your token, Page ID, and IG User ID.
+4. `docker compose up -d --build`
+5. Register the server with your MCP client (Claude Code or Claude Desktop).
 
-`check_token_validity` now introspects **both** tokens and tells you whether
-the page token is derivable at all — use it first when debugging permission
-errors.
+### Required token scopes
 
-### Meta App Dashboard / OAuth setup checklist
+| Scope | Required for |
+|---|---|
+| `pages_show_list` | Everything — used to derive the Page Access Token |
+| `pages_read_engagement` | Analytics |
+| `pages_manage_posts` | FB Page publishing |
+| `instagram_basic` | IG account info |
+| `instagram_content_publish` | IG publishing |
+| `publish_to_groups` | FB Group cross-posting (optional) |
 
-A code-side fix only routes the right token to the right endpoint. The
-following must be done manually in the Meta App Dashboard / when generating
-the token; the server cannot do it for you:
-
-1. **App type** — Meta App must be type **Business** with the
-   *Instagram Graph API* and *Facebook Login for Business* products added.
-2. **IG ↔ Page link** — the IG Professional account must be linked to the
-   FB Page in the Page's Linked Accounts settings. Without that link IG
-   publishing returns `(#10)`.
-3. **App Review** — `instagram_content_publish`, `pages_manage_posts` and
-   `publish_to_groups` require Meta App Review for non-admins. During
-   development you can use any admin/developer/tester user of the app
-   without review.
-4. **App mode** — to publish on behalf of users who are *not* admins/devs/
-   testers, switch the app from *Development* to *Live* (Settings → Basic).
-   While in Development mode, the configured `META_ACCESS_TOKEN` must
-   belong to such a privileged user.
-5. **Token generation** — in Graph API Explorer pick your app, select the
-   user, request the scopes listed above, then exchange the short-lived
-   token for a long-lived one (curl below). Long-lived user tokens last
-   ~60 days; the derived page token does not expire as long as the parent
-   user token is valid.
-
-## One-time Meta setup
-
-1. Create a Meta App at <https://developers.facebook.com/apps/> of type
-   **Business**.
-2. Add the **Facebook Login for Business** and **Instagram Graph API**
-   products to the app.
-3. In your Facebook Page settings, link it to the Instagram Professional
-   account you want to publish to.
-4. Use the Graph API Explorer (or your own OAuth flow) to obtain a short-lived
-   user access token granting the scopes listed above.
-5. Exchange it for a long-lived (~60 day) token:
-
-   ```bash
-   curl -G "https://graph.facebook.com/v25.0/oauth/access_token" \
-     -d grant_type=fb_exchange_token \
-     -d client_id="$META_APP_ID" \
-     -d client_secret="$META_APP_SECRET" \
-     -d fb_exchange_token="$SHORT_LIVED_TOKEN"
-   ```
-
-6. Discover your IDs:
-
-   ```bash
-   # Facebook Page id + linked Instagram Business Account id
-   curl -G "https://graph.facebook.com/v25.0/me/accounts" \
-     -d fields="id,name,instagram_business_account" \
-     -d access_token="$LONG_LIVED_TOKEN"
-   ```
-
-7. Put the values into `.env` (copy `.env.example`).
+---
 
 ## Running
 
-### Directly with Python
+### Docker Compose (recommended)
 
 ```bash
 cp .env.example .env
 # edit .env
 
+docker compose up -d --build
+```
+
+Two containers start:
+- `instagram-mcp` — MCP server on `MCP_PORT` (default 3224)
+- `instagram-mcp-files` — nginx sidecar on `FILE_SERVER_PORT` (default 3223) for image staging
+
+### Plain Python
+
+```bash
+cp .env.example .env
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 python server.py
 ```
 
-The server speaks MCP over stdio — it's meant to be launched by an MCP
-client, not run standalone for long.
+---
 
-### With Docker (preferred on the homelab)
+## Connecting an MCP client
+
+### Claude Code
 
 ```bash
-cp .env.example .env
-# edit .env
-
-docker compose build
-# the image is now available as instagram-mcp:latest
-# Claude Code will invoke `docker run` directly (see below) — you don't
-# usually `docker compose up` this service.
+claude mcp add instagram -- docker run --rm -i \
+  --env-file /opt/social/.env \
+  instagram-mcp:latest
 ```
 
-## Transports
-
-The server supports three MCP transports, picked by `MCP_TRANSPORT` in `.env`:
-
-| Mode | When | URL / how the client reaches it |
-| --- | --- | --- |
-| `stdio` | Local Claude Code spawns the container per call | JSON-RPC over the process' stdin/stdout — no network |
-| `streamable-http` (default) | Persistent container, GUI clients like Claude Desktop | `http://<host>:${MCP_PORT}/mcp` |
-| `sse` | Same as above, legacy transport | `http://<host>:${MCP_PORT}/sse` |
-
-The persistent HTTP service runs on `0.0.0.0:${MCP_PORT}` (default 3224) so any
-LAN client can reach it. There is **no built-in auth** — restrict access at the
-network layer or put Caddy with a bearer-token check in front if you expose it
-beyond the LAN.
-
-### Adding via the Claude Desktop GUI
-
-Settings → Developer → Custom Connectors → *Add custom connector* → paste:
-
-```
-http://<homelab-lan-ip-or-name>:3224/mcp
-```
-
-Some Claude Desktop versions reject plain `http://` URLs and require HTTPS.
-If yours does, terminate TLS with Caddy in front and use that URL instead.
-
-## Registering with Claude Code
-
-Drop one of these into your project's `.mcp.json` (or `~/.claude.json`
-globally):
-
-**Plain Python:**
-
-```json
-{
-  "mcpServers": {
-    "instagram": {
-      "command": "python",
-      "args": ["/opt/social/server.py"],
-      "env": {}
-    }
-  }
-}
-```
-
-**Docker:**
+Or in `.mcp.json`:
 
 ```json
 {
   "mcpServers": {
     "instagram": {
       "command": "docker",
-      "args": [
-        "run", "--rm", "-i",
-        "--env-file", "/opt/social/.env",
-        "instagram-mcp:latest"
-      ]
+      "args": ["run", "--rm", "-i", "--env-file", "/opt/social/.env", "instagram-mcp:latest"]
     }
   }
 }
 ```
 
-Or register from the CLI:
+### Claude Desktop
 
-```bash
-claude mcp add instagram -- docker run --rm -i --env-file /opt/social/.env instagram-mcp:latest
+Settings → Developer → Custom Connectors → Add:
+
+```
+http://<host>:3224/mcp
 ```
 
-Then ask Claude Code something like:
+---
 
-> "Use the instagram tool to post `https://…/foo.jpg` with caption `Hello`."
+## MCP transports
 
-## Local-folder workflow
+| `MCP_TRANSPORT` | Use when | Client URL |
+|---|---|---|
+| `streamable-http` (default) | Persistent container, Claude Desktop, LAN clients | `http://<host>:3224/mcp` |
+| `sse` | Same, legacy transport | `http://<host>:3224/sse` |
+| `stdio` | Claude Code spawns container per call | stdio (no network) |
 
-For posting without first uploading the image or video anywhere external:
+No built-in auth — restrict at the network layer or put a TLS-terminating proxy with a bearer-token check in front if you expose beyond the LAN.
+
+---
+
+## File layout
 
 ```
 data/
-├── images/                 # drop image and video files here
-├── public/                 # transient: nginx serves <token>/<filename>
-└── posted/YYYY-MM-DD/      # archive after successful publish
+├── images/          # drop photos and videos here before posting
+├── public/          # transient: nginx serves staged files here
+├── posted/          # archived after successful publish, by date
+│   └── YYYY-MM-DD/
+└── scheduler/       # APScheduler SQLite jobstore
 ```
 
-1. Copy a JPEG/PNG (or MP4/MOV for Reels) into `/opt/social/data/images/`.
-2. Ask Claude: *"List my pending images, then post `sunset.jpg` to Instagram
-   with the caption 'Evening over the Alps.'"* — or *"post `reel.mp4` as an IG
-   Reel with caption '…'."*
-3. The MCP server hardlinks the file into `data/public/<random-token>/<name>`,
-   nginx serves it at `https://social.example.com/<token>/<name>`, Meta
-   fetches it, the token directory is removed, the original is moved to
-   `data/posted/YYYY-MM-DD/<name>`.
+---
 
-**Facebook** doesn't need the public URL — `post_facebook_local_photo` and
-`post_facebook_local_video` upload the bytes directly via multipart `source`,
-and `post_facebook_local_reel` uses Meta's resumable upload endpoint.
+## Tool reference
 
-### Reels & video notes
+### Posting
 
-- IG Reels and FB videos go through `data/images/` as well — the inbox isn't
-  image-only, despite the directory name. Use `list_pending_videos` to see only
-  `.mp4 / .mov / .m4v` candidates.
-- Reel container processing is much slower than photos. Default Reel timeout
-  is `IG_REEL_CONTAINER_TIMEOUT_SECONDS=600` with `IG_REEL_CONTAINER_POLL_SECONDS=5`
-  (vs. 90 s / 3 s for photos). Override in `.env` if your clips are very long.
-- `post_instagram_reel(share_to_feed=True)` (default) makes the Reel show up in
-  the main feed grid as well; pass `False` for Reels-tab-only.
-- FB Page Reels use a different surface than regular video posts: pick
-  `post_facebook_local_reel` for Reels, `post_facebook_local_video` for the
-  classic Page video player.
+| Tool | What it does |
+|---|---|
+| `post_instagram_photo(image_url, caption, alt_text)` | IG feed photo from a public URL |
+| `post_facebook_photo(image_url, caption)` | FB Page photo from a public URL |
+| `post_instagram_local_photo(filename, caption, alt_text, also_story)` | IG feed photo from inbox; stages, posts, archives |
+| `post_facebook_local_photo(filename, caption, also_story, group_ids)` | FB Page photo from inbox; direct multipart upload |
+| `post_local_photo_dual(filename, caption, alt_text, also_story_ig, also_story_fb)` | Both platforms in one job |
+| `post_instagram_local_carousel(filenames, caption)` | IG carousel (2–10 photos) |
+| `post_facebook_local_carousel(filenames, caption)` | FB multi-photo post (2–10 photos) |
+| `post_local_carousel_dual(filenames, caption)` | Carousel to both platforms |
+| `post_instagram_reel(video_url, caption, share_to_feed)` | IG Reel from a public URL |
+| `post_instagram_local_reel(filename, caption, share_to_feed)` | IG Reel from inbox |
+| `post_facebook_video(video_url, caption)` | FB Page video from a public URL |
+| `post_facebook_local_video(filename, caption)` | FB Page video from inbox |
+| `post_facebook_local_reel(filename, description)` | FB Page Reel from inbox |
+| `post_local_reel_dual(filename, caption, share_to_feed)` | Reel to both platforms |
 
-### Reverse-proxy snippet (Caddy)
+### Scheduling
 
-Caddy runs on a remote VPS and reaches this host over Headscale, so the nginx
-sidecar binds on `0.0.0.0:${FILE_SERVER_PORT}` (default 3223). Add to the
-remote Caddyfile and reload — replace `<homelab-tailscale-name>` with the
-host's name on your tailnet:
+| Tool | What it does |
+|---|---|
+| `schedule_instagram_local_photo(filename, when, caption, also_story)` | Queue an IG photo post |
+| `schedule_facebook_local_photo(filename, when, caption, also_story)` | Queue a FB photo post |
+| `schedule_instagram_local_carousel(filenames, when, caption)` | Queue an IG carousel |
+| `schedule_facebook_local_carousel(filenames, when, caption)` | Queue a FB carousel |
+| `schedule_instagram_local_reel(filename, when, caption, share_to_feed)` | Queue an IG Reel |
+| `schedule_facebook_local_video(filename, when, caption)` | Queue a FB video post |
+| `schedule_facebook_local_reel(filename, when, description)` | Queue a FB Reel |
+| `list_scheduled_posts()` | Show pending jobs |
+| `cancel_scheduled_post(job_id)` | Remove a pending job |
+
+`when` accepts `in 2h`, `in 1d`, or an ISO timestamp (Europe/Berlin if naive).
+
+### Inbox
+
+| Tool | What it does |
+|---|---|
+| `list_pending_images()` | List postable photos in `data/images/` |
+| `list_pending_videos()` | List postable videos in `data/images/` |
+| `show_image(filename, max_side)` | Render an inbox image inline so Claude can see it |
+
+### Analytics
+
+| Tool | What it does |
+|---|---|
+| `get_instagram_account_insights(metric, period, since_days)` | Account-level IG metrics (reach, engagement, followers) |
+| `get_instagram_post_insights(media_id, metric)` | Per-post IG metrics |
+| `get_facebook_page_insights(metric, period, since_days)` | Page-level FB metrics |
+| `get_facebook_post_insights(post_id, metric)` | Per-post FB metrics |
+| `top_performing_posts(platform, limit, top_n)` | Rank recent posts by engagement |
+| `list_recent_instagram_posts(limit)` | Raw IG media list |
+| `list_recent_facebook_posts(limit)` | Raw FB Page post list |
+
+### Autopilot
+
+| Tool | What it does |
+|---|---|
+| `autopilot_plan(days_ahead, max_posts, slots_per_day, …)` | Analyse inbox, dedup, cluster into carousels, propose a schedule |
+| `autopilot_commit(plan)` | Validate and queue the filled-in plan |
+
+### Utility
+
+| Tool | What it does |
+|---|---|
+| `check_token_validity()` | Inspect token scopes, type, and expiry |
+
+---
+
+## Meta API notes
+
+- **Graph API version:** v25.0 (latest stable as of 2026-02-18). Set via `GRAPH_API_VERSION` in `.env`.
+- **IG rate limit:** 50 posts per 24-hour rolling window. The server checks before each publish and refuses if the quota is full.
+- **Container polling:** IG requires a two-step create → publish flow with a status poll in between. Photos time out after 90 s; Reels after 600 s (both configurable in `.env`).
+- **Token lifetime:** Long-lived user tokens last ~60 days. Use `check_token_validity` to monitor, and re-exchange before expiry. See SETUP.md for the renewal curl command.
+- **Errors:** Meta errors are surfaced verbatim — `code`, `error_subcode`, `message`, `fbtrace_id`, and the user-facing message — rather than being swallowed.
+
+---
+
+## Reverse proxy (Caddy)
+
+The nginx sidecar speaks plain HTTP. If Caddy runs on a remote VPS and reaches this host over Tailscale/Headscale:
 
 ```caddy
 social.example.com {
@@ -309,30 +247,4 @@ social.example.com {
 }
 ```
 
-The sidecar speaks plain HTTP; Caddy handles the public TLS cert.
-
-### Bringing the stack up
-
-```bash
-docker compose -f /opt/social/docker-compose.yml up -d --build instagram-mcp-files
-# the MCP container itself is invoked by Claude Code per call (stdio), not
-# kept running — only the nginx sidecar runs continuously.
-```
-
-## Operational notes
-
-- **URL reachability** — Meta fetches the image server-side, so `image_url`
-  must be publicly accessible HTTPS and serve `Content-Type: image/*`. The
-  server HEAD-checks the URL before each publish and refuses if it can't be
-  reached.
-- **Rate limit** — Before each IG publish, the server reads
-  `/content_publishing_limit` and refuses if `quota_usage >= 50`. The quota
-  is per 24 h rolling window, per IG account.
-- **Container polling** — Polls every `IG_CONTAINER_POLL_SECONDS` (default
-  3 s) up to `IG_CONTAINER_TIMEOUT_SECONDS` (default 90 s). If the container
-  transitions to `ERROR` or `EXPIRED` the tool returns a structured error.
-- **Token lifetime** — Long-lived user tokens last ~60 days. Use
-  `check_token_validity` to monitor; refresh by re-exchanging through
-  `oauth/access_token` before expiry. Page access tokens derived from a
-  long-lived user token do not expire as long as the user token stays valid.
-- **Logs** go to stderr; stdout is reserved for MCP JSON-RPC framing.
+Set `PUBLIC_BASE_URL=https://social.example.com` in `.env`.
