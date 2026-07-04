@@ -20,6 +20,7 @@ Or containerised: see Dockerfile / docker-compose.yml
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import json
 import logging
@@ -32,6 +33,7 @@ from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.utilities.types import Image
 
+import autopilot
 import exif_reader
 import local_files
 import scheduler
@@ -870,6 +872,246 @@ async def post_facebook_local_carousel(
 
 
 # ---------------------------------------------------------------------------
+# Tools — cross-platform combined posts (IG + FB Page in one job)
+# ---------------------------------------------------------------------------
+#
+# These power the `cross_photo` / `cross_carousel` / `cross_reel` scheduler
+# targets used by autopilot_commit. The motivation: posting the same file to
+# both platforms via the per-platform tools fails on the second call because
+# the first one archives the source. Doing both inside one async function
+# means we archive exactly once at the end.
+
+
+@mcp.tool()
+async def post_local_photo_dual(
+    filename: str,
+    caption: str = "",
+    alt_text: str = "",
+    also_story_ig: bool = True,
+    also_story_fb: bool = True,
+) -> dict[str, Any]:
+    """Publish one inbox photo to BOTH Instagram and the Facebook Page in one go.
+
+    Stages the file behind a one-shot public URL, posts the IG feed (and
+    optionally IG Story), then uploads directly to the FB Page (and optionally
+    FB Page Story). The source is archived once after both platforms run, so
+    you never re-stage the same file twice. Partial failures are surfaced
+    per-platform — the call returns ok=True if at least one platform published.
+    """
+    if not PUBLIC_BASE_URL:
+        return {"ok": False, "error": "PUBLIC_BASE_URL not configured — set it in .env"}
+    try:
+        src = local_files.resolve_image(DATA_DIR, filename)
+    except LocalFileError as e:
+        return {"ok": False, "error": str(e)}
+
+    try:
+        token, _link, public_url = local_files.stage_for_serving(DATA_DIR, src, PUBLIC_BASE_URL)
+    except Exception as e:
+        return _err("staging file for serving failed", e)
+
+    log.info(
+        "post_local_photo_dual file=%s ig_story=%s fb_story=%s",
+        filename, also_story_ig, also_story_fb,
+    )
+    out: dict[str, Any] = {"source_filename": filename, "served_url": public_url}
+    try:
+        ig_feed = await post_instagram_photo(public_url, caption=caption, alt_text=alt_text)
+        out["instagram"] = ig_feed
+        out["instagram_story"] = None
+        if ig_feed.get("ok") and also_story_ig:
+            async with _new_client() as client:
+                out["instagram_story"] = await _post_ig_story(client, public_url)
+
+        async with _new_client() as client:
+            try:
+                fb_raw = await client.post_fb_page_photo_file(
+                    file_path=src, caption=caption or None, published=True,
+                )
+                out["facebook"] = {
+                    "ok": True,
+                    "photo_id": fb_raw.get("id"),
+                    "post_id": fb_raw.get("post_id"),
+                    "raw": fb_raw,
+                }
+            except Exception as e:
+                out["facebook"] = _err("facebook page photo upload failed", e)
+            if out["facebook"].get("ok") and also_story_fb:
+                out["facebook_story"] = await _post_fb_story_from_file(client, src)
+            else:
+                out["facebook_story"] = None
+    finally:
+        local_files.unstage(DATA_DIR, token)
+
+    ok = bool(
+        (out.get("instagram") or {}).get("ok")
+        or (out.get("facebook") or {}).get("ok")
+    )
+    out["ok"] = ok
+    if ok:
+        try:
+            archived = local_files.archive(DATA_DIR, src)
+            out["archived_to"] = str(archived)
+        except Exception as e:
+            log.warning("archive failed for %s: %s", filename, e)
+            out["archive_warning"] = str(e)
+    return out
+
+
+@mcp.tool()
+async def post_local_carousel_dual(
+    filenames: list[str],
+    caption: str = "",
+) -> dict[str, Any]:
+    """Publish a multi-photo carousel to BOTH IG and the FB Page in one job.
+
+    Stages every photo once, builds the IG CAROUSEL via public URLs, uploads
+    each photo unpublished to FB then creates a multi-photo feed post. Archives
+    all sources once at the end. Same partial-failure semantics as
+    `post_local_photo_dual`.
+    """
+    if not PUBLIC_BASE_URL:
+        return {"ok": False, "error": "PUBLIC_BASE_URL not configured — set it in .env"}
+    if not 2 <= len(filenames) <= 10:
+        return {"ok": False, "error": "carousel needs between 2 and 10 photos"}
+
+    srcs: list[pathlib.Path] = []
+    for fn in filenames:
+        try:
+            srcs.append(local_files.resolve_image(DATA_DIR, fn))
+        except LocalFileError as e:
+            return {"ok": False, "error": str(e)}
+
+    try:
+        staged = _stage_many(srcs)
+    except Exception as e:
+        return _err("staging files for serving failed", e)
+    tokens = [t for t, _ in staged]
+    urls = [u for _, u in staged]
+
+    log.info("post_local_carousel_dual files=%s", filenames)
+    out: dict[str, Any] = {"source_filenames": filenames}
+    try:
+        async with _new_client() as client:
+            try:
+                child_ids: list[str] = []
+                for url in urls:
+                    child_ids.append(await client.create_ig_carousel_item(url))
+                parent_id = await client.create_ig_carousel_container(child_ids, caption=caption or None)
+                status = await client.wait_for_container(
+                    parent_id, timeout_seconds=CONTAINER_TIMEOUT, poll_interval=CONTAINER_POLL,
+                )
+                published = await client.publish_ig_container(parent_id)
+                out["instagram"] = {
+                    "ok": True,
+                    "media_id": published.get("id"),
+                    "parent_container_id": parent_id,
+                    "child_container_ids": child_ids,
+                    "container_final_status": status.status_code,
+                }
+            except Exception as e:
+                out["instagram"] = _err("ig carousel publish failed", e)
+
+            try:
+                photo_ids: list[str] = []
+                for src in srcs:
+                    raw = await client.post_fb_page_photo_file(file_path=src, published=False)
+                    pid = raw.get("id")
+                    if not pid:
+                        raise MetaAPIError({"error": {"message": f"fb upload missing id: {raw}"}})
+                    photo_ids.append(str(pid))
+                feed = await client.post_fb_page_multi_photo_feed(photo_ids, message=caption or None)
+                out["facebook"] = {
+                    "ok": True,
+                    "post_id": feed.get("id"),
+                    "photo_ids": photo_ids,
+                    "raw": feed,
+                }
+            except Exception as e:
+                out["facebook"] = _err("fb carousel publish failed", e)
+    finally:
+        _unstage_many(tokens)
+
+    ok = bool(
+        (out.get("instagram") or {}).get("ok")
+        or (out.get("facebook") or {}).get("ok")
+    )
+    out["ok"] = ok
+    if ok:
+        archives: list[str] = []
+        warnings: list[str] = []
+        for src in srcs:
+            try:
+                archives.append(str(local_files.archive(DATA_DIR, src)))
+            except Exception as e:
+                warnings.append(f"{src.name}: {e}")
+        out["archived_to"] = archives
+        if warnings:
+            out["archive_warnings"] = warnings
+    return out
+
+
+@mcp.tool()
+async def post_local_reel_dual(
+    filename: str,
+    caption: str = "",
+    share_to_feed: bool = True,
+) -> dict[str, Any]:
+    """Publish a video as IG Reel + FB Page Reel in one job.
+
+    Stages the video once for IG (which needs a public URL), uploads the file
+    directly to FB Reels via the resumable protocol. Archives the source once
+    after both publishes finish. `share_to_feed` applies to the IG side only.
+    """
+    if not PUBLIC_BASE_URL:
+        return {"ok": False, "error": "PUBLIC_BASE_URL not configured — set it in .env"}
+    try:
+        src = local_files.resolve_video(DATA_DIR, filename)
+    except LocalFileError as e:
+        return {"ok": False, "error": str(e)}
+
+    try:
+        token, _link, public_url = local_files.stage_for_serving(DATA_DIR, src, PUBLIC_BASE_URL)
+    except Exception as e:
+        return _err("staging file for serving failed", e)
+
+    log.info("post_local_reel_dual file=%s share_to_feed=%s", filename, share_to_feed)
+    out: dict[str, Any] = {"source_filename": filename, "served_url": public_url}
+    try:
+        out["instagram"] = await post_instagram_reel(
+            public_url, caption=caption, share_to_feed=share_to_feed,
+        )
+        async with _new_client() as client:
+            try:
+                raw = await client.publish_fb_reel_file(
+                    file_path=src, description=caption or None,
+                )
+                out["facebook"] = {
+                    "ok": True,
+                    "video_id": raw.get("video_id"),
+                    "raw": raw,
+                }
+            except Exception as e:
+                out["facebook"] = _err("fb reel publish failed", e)
+    finally:
+        local_files.unstage(DATA_DIR, token)
+
+    ok = bool(
+        (out.get("instagram") or {}).get("ok")
+        or (out.get("facebook") or {}).get("ok")
+    )
+    out["ok"] = ok
+    if ok:
+        try:
+            archived = local_files.archive(DATA_DIR, src)
+            out["archived_to"] = str(archived)
+        except Exception as e:
+            log.warning("archive failed for %s: %s", filename, e)
+            out["archive_warning"] = str(e)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Tools — post history (so Claude can match new photos against prior posts)
 # ---------------------------------------------------------------------------
 
@@ -918,6 +1160,226 @@ async def list_recent_facebook_posts(
         "count": len(payload.get("data") or []),
         "posts": payload.get("data") or [],
         "paging": payload.get("paging") or {},
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tools — Insights (so Claude can learn what actually performs for you)
+# ---------------------------------------------------------------------------
+
+
+def _epoch_window(since_days: int | None) -> tuple[int | None, int | None]:
+    if not since_days:
+        return None, None
+    now = int(dt.datetime.now(tz=dt.timezone.utc).timestamp())
+    return now - int(since_days) * 86400, now
+
+
+@mcp.tool()
+async def get_instagram_account_insights(
+    metric: list[str] | None = None,
+    period: str = "day",
+    since_days: int | None = None,
+) -> dict[str, Any]:
+    """Fetch Instagram account-level insights.
+
+    Default metric set is `reach,accounts_engaged,profile_views,total_followers`
+    — all `metric_type=total_value` on Graph v25. Pass a list of metric names to
+    override. `period` is one of `day` / `week` / `days_28`. `since_days` bounds
+    the window to the last N days (Unix-epoch since/until); otherwise Meta
+    returns the current period.
+    """
+    metrics = metric or ["reach", "accounts_engaged", "profile_views", "total_followers"]
+    since, until = _epoch_window(since_days)
+    async with _new_client() as client:
+        try:
+            payload = await client.get_ig_account_insights(
+                metric=metrics, period=period, since=since, until=until,
+            )
+        except Exception as e:
+            return _err("ig account insights failed", e)
+    return {"ok": True, "metric": metrics, "period": period, "data": payload.get("data") or []}
+
+
+@mcp.tool()
+async def get_instagram_post_insights(
+    media_id: str,
+    metric: list[str] | None = None,
+) -> dict[str, Any]:
+    """Fetch per-post Instagram insights for one media id.
+
+    Default metric set targets feed photos / carousels: `reach,likes,comments,
+    shares,saved,total_interactions`. For Reels use `reach,plays,likes,comments,
+    shares,saved,total_interactions`; for Stories use `reach,impressions,
+    replies,taps_forward,taps_back,exits`. Meta is strict — wrong metric for
+    media_product_type returns an error.
+    """
+    metrics = metric or ["reach", "likes", "comments", "shares", "saved", "total_interactions"]
+    async with _new_client() as client:
+        try:
+            payload = await client.get_ig_media_insights(media_id, metrics)
+        except Exception as e:
+            return _err("ig media insights failed", e)
+    return {"ok": True, "media_id": media_id, "metric": metrics, "data": payload.get("data") or []}
+
+
+@mcp.tool()
+async def get_facebook_page_insights(
+    metric: list[str] | None = None,
+    period: str = "day",
+    since_days: int | None = None,
+) -> dict[str, Any]:
+    """Fetch Facebook Page-level insights.
+
+    Default metric set: `page_impressions,page_engaged_users,page_fans`.
+    Periods: `day` / `week` / `days_28` / `month` / `lifetime`.
+    """
+    metrics = metric or ["page_impressions", "page_engaged_users", "page_fans"]
+    since, until = _epoch_window(since_days)
+    async with _new_client() as client:
+        try:
+            payload = await client.get_fb_page_insights(
+                metric=metrics, period=period, since=since, until=until,
+            )
+        except Exception as e:
+            return _err("fb page insights failed", e)
+    return {"ok": True, "metric": metrics, "period": period, "data": payload.get("data") or []}
+
+
+@mcp.tool()
+async def get_facebook_post_insights(
+    post_id: str,
+    metric: list[str] | None = None,
+) -> dict[str, Any]:
+    """Fetch per-post Facebook insights for one post id.
+
+    Default metric set: `post_impressions,post_impressions_unique,
+    post_engaged_users,post_clicks`. For video posts also try
+    `post_video_views,post_video_avg_time_watched`.
+    """
+    metrics = metric or [
+        "post_impressions",
+        "post_impressions_unique",
+        "post_engaged_users",
+        "post_clicks",
+    ]
+    async with _new_client() as client:
+        try:
+            payload = await client.get_fb_post_insights(post_id, metrics)
+        except Exception as e:
+            return _err("fb post insights failed", e)
+    return {"ok": True, "post_id": post_id, "metric": metrics, "data": payload.get("data") or []}
+
+
+def _ig_metric_values(raw: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for entry in raw.get("data") or []:
+        name = entry.get("name")
+        if not name:
+            continue
+        values = entry.get("values") or []
+        total_value = entry.get("total_value") or {}
+        if values and isinstance(values[-1], dict) and "value" in values[-1]:
+            out[name] = values[-1]["value"]
+        elif "value" in total_value:
+            out[name] = total_value["value"]
+    return out
+
+
+def _ig_score(values: dict[str, Any]) -> int:
+    """Engagement score for ranking IG posts.
+
+    Prefers Meta's `total_interactions` aggregate when present, otherwise sums
+    the per-action counts so older posts (or media product types that don't
+    report total_interactions) still rank.
+    """
+    ti = values.get("total_interactions")
+    if isinstance(ti, (int, float)):
+        return int(ti)
+    return int(
+        (values.get("likes") or 0)
+        + (values.get("comments") or 0)
+        + (values.get("shares") or 0)
+        + (values.get("saved") or 0)
+    )
+
+
+@mcp.tool()
+async def top_performing_posts(
+    platform: str = "instagram",
+    limit: int = 25,
+    top_n: int = 5,
+) -> dict[str, Any]:
+    """Rank recent posts by engagement so Claude can learn your voice.
+
+    Pulls the most recent `limit` posts on the platform, fetches per-post
+    insights in parallel, and returns the top `top_n` sorted by total
+    interactions (IG) or post_engaged_users (FB). Use the captions of the top
+    performers as in-context examples when writing new captions — that's the
+    feedback loop that closes "maximum reach with minimum effort".
+    """
+    platform = platform.lower()
+    if platform not in {"instagram", "facebook"}:
+        return {"ok": False, "error": "platform must be 'instagram' or 'facebook'"}
+    if limit <= 0 or top_n <= 0:
+        return {"ok": False, "error": "limit and top_n must be positive"}
+
+    async with _new_client() as client:
+        try:
+            if platform == "instagram":
+                listing = await client.list_ig_recent_media(limit=limit)
+            else:
+                listing = await client.list_fb_page_recent_posts(limit=limit)
+        except Exception as e:
+            return _err(f"list recent {platform} posts failed", e)
+
+        items = listing.get("data") or []
+
+        async def _fetch_ig(item: dict[str, Any]) -> dict[str, Any]:
+            pid = item.get("id")
+            mpt = (item.get("media_product_type") or "FEED").upper()
+            if not pid:
+                return {"item": item, "insights": None, "score": 0}
+            if mpt == "REELS":
+                metrics = ["reach", "plays", "likes", "comments", "shares", "saved", "total_interactions"]
+            elif mpt == "STORY":
+                metrics = ["reach", "impressions", "replies"]
+            else:
+                metrics = ["reach", "likes", "comments", "shares", "saved", "total_interactions"]
+            try:
+                raw = await client.get_ig_media_insights(pid, metrics)
+            except MetaAPIError as e:
+                return {"item": item, "insights": None, "score": 0, "error": e.to_dict()}
+            values = _ig_metric_values(raw)
+            return {"item": item, "insights": values, "score": _ig_score(values)}
+
+        async def _fetch_fb(item: dict[str, Any]) -> dict[str, Any]:
+            pid = item.get("id")
+            if not pid:
+                return {"item": item, "insights": None, "score": 0}
+            try:
+                raw = await client.get_fb_post_insights(pid, [
+                    "post_impressions",
+                    "post_impressions_unique",
+                    "post_engaged_users",
+                    "post_clicks",
+                ])
+            except MetaAPIError as e:
+                return {"item": item, "insights": None, "score": 0, "error": e.to_dict()}
+            values = _ig_metric_values(raw)
+            score = values.get("post_engaged_users") or values.get("post_impressions_unique") or 0
+            return {"item": item, "insights": values, "score": int(score or 0)}
+
+        fetcher = _fetch_ig if platform == "instagram" else _fetch_fb
+        results = await asyncio.gather(*(fetcher(it) for it in items))
+
+    sorted_res = sorted(results, key=lambda r: r.get("score", 0) or 0, reverse=True)
+    return {
+        "ok": True,
+        "platform": platform,
+        "count_considered": len(results),
+        "top_n": top_n,
+        "top": sorted_res[:top_n],
     }
 
 
@@ -1088,6 +1550,91 @@ async def cancel_scheduled_post(job_id: str) -> dict[str, Any]:
     except Exception as e:
         return _err(f"could not remove job {job_id}", e)
     return {"ok": True, "removed": job_id}
+
+
+@mcp.tool()
+async def autopilot_plan(
+    days_ahead: int = 14,
+    max_posts: int = 14,
+    slots_per_day: list[str] | None = None,
+    dedup_hamming: int = 5,
+    cluster_time_minutes: int = 60,
+    cluster_distance_meters: int = 500,
+    cross_post_to_facebook: bool = True,
+    include_story: bool = True,
+) -> dict[str, Any]:
+    """Analyse the image inbox and return a proposed 2-week posting plan.
+
+    Workflow:
+    1. Call this tool — it deduplicates near-identical burst shots via
+       perceptual hash, groups photos by EXIF time + GPS into carousel
+       candidates, and proposes one posting slot per item spread over
+       `days_ahead` days.
+    2. For each plan item use `show_image` (or `image://{filename}`) to look
+       at the photo(s) and write a `caption`.
+    3. Call `autopilot_commit(plan)` with the filled-in plan to schedule
+       everything at once.
+
+    Args:
+        days_ahead: Spread posts over this many future days (max 30).
+        max_posts: Cap the number of plan items (default 14 = 1 post/day).
+        slots_per_day: List of HH:MM times to use as daily slots, e.g.
+            ["12:00","19:30"]. Defaults to ["12:00","19:30"].
+        dedup_hamming: Perceptual-hash Hamming distance ≤ this => duplicate
+            burst; default 5 keeps obviously different shots.
+        cluster_time_minutes: Photos within this window (default 60 min)
+            that are also within `cluster_distance_meters` are grouped into
+            a carousel.
+        cluster_distance_meters: GPS proximity threshold (default 500 m).
+        cross_post_to_facebook: When True (default) every item is also
+            posted to the Facebook Page in the same scheduled job.
+        include_story: When True (default) IG and FB Stories are added
+            alongside feed posts.
+    """
+    return autopilot.triage(
+        data_dir=DATA_DIR,
+        days_ahead=days_ahead,
+        max_posts=max_posts,
+        slots_per_day=slots_per_day,
+        dedup_hamming=dedup_hamming,
+        cluster_time_minutes=cluster_time_minutes,
+        cluster_distance_meters=cluster_distance_meters,
+        cross_post_to_facebook=cross_post_to_facebook,
+        include_story=include_story,
+    )
+
+
+@mcp.tool()
+async def autopilot_commit(
+    plan: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Schedule every item in the autopilot plan returned by `autopilot_plan`.
+
+    Each item must have `caption` filled in (you write those after looking at
+    the photos) and a valid future `slot_iso`. All files are validated before
+    any job is queued — the call either fully succeeds or returns the full
+    error list so you can fix and retry.
+
+    Expected plan-item shape::
+
+        {
+          "id": 1,
+          "kind": "photo" | "carousel" | "reel",
+          "filenames": ["foo.jpg"],
+          "slot_iso": "2026-06-16T12:00:00+02:00",
+          "caption": "…your caption…",
+          "alt_text": null,
+          "share_to_feed": true,
+          "also_story": true,
+          "cross_post_to_facebook": true
+        }
+    """
+    return autopilot.commit(
+        data_dir=DATA_DIR,
+        plan=plan,
+        scheduler_get=scheduler.get,
+        run_async_job=scheduler.run_async_job,
+    )
 
 
 @mcp.tool()

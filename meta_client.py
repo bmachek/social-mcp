@@ -593,10 +593,14 @@ class MetaClient:
         """List recent IG media on the configured account.
 
         Returns the raw Graph response so the caller can keep the `paging.cursors`
-        for follow-up calls.
+        for follow-up calls. `media_product_type` lets the caller pick the right
+        insights metric set per item (IMAGE/CAROUSEL/REELS/STORY).
         """
         params: dict[str, Any] = {
-            "fields": "id,caption,media_type,media_url,permalink,thumbnail_url,timestamp",
+            "fields": (
+                "id,caption,media_type,media_product_type,media_url,permalink,"
+                "thumbnail_url,timestamp"
+            ),
             "limit": max(1, min(int(limit), 100)),
         }
         if after:
@@ -604,6 +608,105 @@ class MetaClient:
         page_token = await self.get_page_access_token()
         return await self._request(
             "GET", f"{self.ig_user_id}/media", params=params, token=page_token,
+        )
+
+    # -- Insights ------------------------------------------------------------
+    #
+    # IG account insights require `metric_type=total_value` for most metrics on
+    # Graph v22+ (we're on v25). Per-media metrics don't take a period.
+    # FB Page insights use the classic shape: metric + period (no metric_type).
+    # All Graph errors are surfaced verbatim — Meta is strict about which
+    # metric is supported for which media_product_type.
+
+    async def get_ig_account_insights(
+        self,
+        metric: str | list[str],
+        period: str = "day",
+        since: int | None = None,
+        until: int | None = None,
+        metric_type: str = "total_value",
+    ) -> dict[str, Any]:
+        """GET /{ig-user-id}/insights — account-level metrics.
+
+        Common metrics on v25: `reach`, `accounts_engaged`, `profile_views`,
+        `website_clicks`, `profile_links_taps`, `total_followers`.
+        Periods: `day` / `week` / `days_28`. Pass `since`/`until` as Unix epoch
+        seconds to bound the window; otherwise Meta returns the current period.
+        """
+        metric_str = ",".join(metric) if isinstance(metric, list) else metric
+        params: dict[str, Any] = {
+            "metric": metric_str,
+            "period": period,
+            "metric_type": metric_type,
+        }
+        if since is not None:
+            params["since"] = int(since)
+        if until is not None:
+            params["until"] = int(until)
+        page_token = await self.get_page_access_token()
+        return await self._request(
+            "GET", f"{self.ig_user_id}/insights", params=params, token=page_token,
+        )
+
+    async def get_ig_media_insights(
+        self,
+        media_id: str,
+        metric: str | list[str],
+    ) -> dict[str, Any]:
+        """GET /{media-id}/insights — per-post metrics.
+
+        Metric set differs by `media_product_type`:
+          - FEED / CAROUSEL_ALBUM (image): `reach,likes,comments,shares,saved,total_interactions`
+          - REELS:                        `reach,plays,likes,comments,shares,saved,total_interactions`
+          - STORY:                        `reach,replies,taps_forward,taps_back,exits`
+        """
+        metric_str = ",".join(metric) if isinstance(metric, list) else metric
+        params = {"metric": metric_str}
+        page_token = await self.get_page_access_token()
+        return await self._request(
+            "GET", f"{media_id}/insights", params=params, token=page_token,
+        )
+
+    async def get_fb_page_insights(
+        self,
+        metric: str | list[str],
+        period: str = "day",
+        since: int | None = None,
+        until: int | None = None,
+    ) -> dict[str, Any]:
+        """GET /{page-id}/insights — Page-level metrics.
+
+        Common metrics: `page_impressions`, `page_impressions_unique`,
+        `page_engaged_users`, `page_fans`, `page_fan_adds`.
+        Periods: `day` / `week` / `days_28` / `month` / `lifetime`.
+        """
+        metric_str = ",".join(metric) if isinstance(metric, list) else metric
+        params: dict[str, Any] = {"metric": metric_str, "period": period}
+        if since is not None:
+            params["since"] = int(since)
+        if until is not None:
+            params["until"] = int(until)
+        page_token = await self.get_page_access_token()
+        return await self._request(
+            "GET", f"{self.fb_page_id}/insights", params=params, token=page_token,
+        )
+
+    async def get_fb_post_insights(
+        self,
+        post_id: str,
+        metric: str | list[str],
+    ) -> dict[str, Any]:
+        """GET /{post-id}/insights — per-post metrics.
+
+        Common metrics: `post_impressions`, `post_impressions_unique`,
+        `post_engaged_users`, `post_clicks`, `post_reactions_by_type_total`,
+        `post_video_views`, `post_video_avg_time_watched`.
+        """
+        metric_str = ",".join(metric) if isinstance(metric, list) else metric
+        params = {"metric": metric_str}
+        page_token = await self.get_page_access_token()
+        return await self._request(
+            "GET", f"{post_id}/insights", params=params, token=page_token,
         )
 
     async def list_fb_page_recent_posts(

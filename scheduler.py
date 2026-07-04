@@ -123,6 +123,11 @@ def run_async_job(target: str, kwargs: dict[str, Any]) -> None:
         "instagram_reel": server.post_instagram_local_reel,
         "facebook_video": server.post_facebook_local_video,
         "facebook_reel": server.post_facebook_local_reel,
+        # Cross-platform combined posts. One job hits both IG and FB and
+        # archives the source file once at the end. Used by autopilot_commit.
+        "cross_photo": server.post_local_photo_dual,
+        "cross_carousel": server.post_local_carousel_dual,
+        "cross_reel": server.post_local_reel_dual,
     }
     fn = targets.get(target)
     if fn is None:

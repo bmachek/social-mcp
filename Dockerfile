@@ -12,7 +12,7 @@ RUN useradd --create-home --uid 10001 app
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
-COPY server.py meta_client.py local_files.py exif_reader.py scheduler.py ./
+COPY server.py meta_client.py local_files.py exif_reader.py scheduler.py autopilot.py ./
 
 USER app
 

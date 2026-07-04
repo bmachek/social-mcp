@@ -49,6 +49,16 @@ as of 2026-02-18):
 | `schedule_facebook_local_video(filename, when, caption, published=True)` | Queue a Page video post for later. |
 | `schedule_facebook_local_reel(filename, when, description)` | Queue an FB Page Reel for later. |
 | `check_token_validity()` | Calls `/debug_token`, returns scopes, type, expiry (Unix + ISO), valid flag, and the configured Graph API version. |
+| `post_local_photo_dual(filename, caption, alt_text="", also_story_ig=True, also_story_fb=True)` | Publish one photo to **both** IG and FB Page in a single job; archives the source once at the end. |
+| `post_local_carousel_dual(filenames, caption)` | Multi-photo carousel to both IG and FB Page in one job. |
+| `post_local_reel_dual(filename, caption, share_to_feed=True)` | IG Reel + FB Page Reel in one job, archives once. |
+| `get_instagram_account_insights(metric=[], period="day", since_days=None)` | Account-level IG reach / engagement / followers etc. |
+| `get_instagram_post_insights(media_id, metric=[])` | Per-post IG insights (reach, likes, comments, shares, saves, plays for Reels). |
+| `get_facebook_page_insights(metric=[], period="day", since_days=None)` | Page-level FB impressions / engaged users / fans. |
+| `get_facebook_post_insights(post_id, metric=[])` | Per-post FB insights (impressions, engaged users, clicks). |
+| `top_performing_posts(platform="instagram", limit=25, top_n=5)` | Rank recent posts by engagement score — use the top captions as few-shot examples when writing new ones. |
+| `autopilot_plan(days_ahead=14, max_posts=14, …)` | **Autopilot step 1** — deduplicate inbox with perceptual hash, cluster by EXIF time + GPS into carousels, propose a 2-week schedule. Returns a `plan` list with `caption: null` placeholders. |
+| `autopilot_commit(plan)` | **Autopilot step 2** — after you fill in captions, schedule every plan item at once. Validates all files before queuing. |
 
 Errors from Meta are surfaced verbatim — `code`, `error_subcode`, `message`,
 `fbtrace_id`, and the user-facing message if present — instead of being
