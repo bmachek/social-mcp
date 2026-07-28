@@ -1,5 +1,7 @@
 # social-mcp
 
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/W7X2240HF4)
+
 A self-hosted MCP server that gives Claude the ability to manage your Instagram and Facebook Page — post photos, carousels, and Reels, schedule posts, pull engagement analytics, and run an autopilot that plans and queues two weeks of content from your photo inbox in one go.
 
 You drop files into a folder, ask Claude what to post and when, and it handles the rest: staging, uploading, archiving, and scheduling. Everything runs on your own machine; no third-party service touches your tokens or your media.
